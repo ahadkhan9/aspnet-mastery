@@ -1,10 +1,20 @@
 import { Inter } from 'next/font/google';
 import { Provider } from '@/components/provider';
+import type { Metadata } from 'next';
 import './global.css';
 
 const inter = Inter({
   subsets: ['latin'],
 });
+
+export const metadata: Metadata = {
+  title: {
+    default: 'ASP.NET Core Mastery',
+    template: '%s | ASP.NET Core Mastery',
+  },
+  description:
+    '2-week ASP.NET Core Web API mastery program: chapters, interview questions, scenario drills, and a hands-on CommerceHub project.',
+};
 
 export default function Layout({ children }: LayoutProps<'/'>) {
   return (
