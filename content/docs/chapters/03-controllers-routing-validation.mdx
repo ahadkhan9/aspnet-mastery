@@ -1,0 +1,283 @@
+---
+title: "Chapter 3: Controllers, Routing, Binding & Validation"
+description: Controllers vs Minimal APIs, attribute routing, model binding, FluentValidation, and consistent problem-detail errors.
+---
+
+## Learning objectives
+
+- Choose between controllers and Minimal APIs with a defensible rationale.
+- Design attribute routes with constraints and understand route precedence.
+- Explain `[ApiController]` behaviors and model-binding source inference.
+- Apply validation with FluentValidation — and know when DataAnnotations are enough.
+- Return RFC 9457 problem details consistently from every endpoint.
+
+## Core concepts
+
+### Controllers vs Minimal APIs
+
+The two hosting styles coexist in the same app. The decision is architectural, not performance — since .NET 8 the benchmarks are effectively at parity.
+
+| | Controllers | Minimal APIs |
+|---|---|---|
+| Structure | Class per resource group, actions per verb | Lambda/`Delegate` per endpoint |
+| Best for | Large APIs, many endpoints, heavy reuse (filters, conventions) | Small services, prototypes, high-throughput micro-endpoints |
+| Validation | `[ApiController]` automatic 400s + filters | Manual or endpoint filters (experimental `Http.Validation` package) |
+| OpenAPI | `ActionResult<T>` metadata | `.Produces<T>()` / built-in .NET 9+ OpenAPI |
+| Testability | `WebApplicationFactory` + controller unit tests | `WebApplicationFactory` + endpoint unit tests |
+| DI in actions | Constructor + `[FromServices]` | Parameter injection |
+
+**Default rule:** for CommerceHub (many resources, shared validation/filters, versioning ahead) — **controllers**. Reach for Minimal APIs per-endpoint when the handler is a couple of lines and has no reusable surface.
+
+### `[ApiController]` — the attribute that changes everything
+
+Adding `[ApiController]` to a controller class (plus `[Route]`) switches on a bundle of behaviors — the most-tested controller fact in interviews:
+
+- **Automatic 400 on invalid ModelState** — invalid models return `ValidationProblemDetails` (RFC 9457 with an `errors` map) without any code in the action.
+- **Binding source inference** — the framework guesses where parameters come from instead of requiring `[FromBody]`/`[FromQuery]` everywhere.
+- **Attribute routing is required** — conventional routing with `[ApiController]` throws `InvalidOperationException` at startup.
+- **ProblemDetails for unhandled errors** (ASP.NET Core 8+) via `AddProblemDetails()`.
+
+```csharp
+[ApiController]
+[Route("api/products")]
+public class ProductsController : ControllerBase
+{
+    private readonly IProductRepository _products;
+
+    public ProductsController(IProductRepository products) => _products = products;
+
+    [HttpGet("{id:int}")]
+    [ProducesResponseType<ProductDto>(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<ProductDto>> GetById(int id, CancellationToken ct)
+    {
+        var product = await _products.GetByIdAsync(id, ct);
+        return product is null ? NotFound() : Ok(product);
+    }
+
+    [HttpPost]
+    [ProducesResponseType<ProductDto>(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<ActionResult<ProductDto>> Create(CreateProductDto dto, CancellationToken ct)
+    {
+        var product = await _products.CreateAsync(dto, ct);
+        return CreatedAtAction(nameof(GetById), new { id = product.Id }, product);
+    }
+}
+```
+
+### Attribute routing & constraints
+
+Routes are matched by **precedence**: literal segments beat parameters, parameters beat catch-alls; more constrained routes win ties. Constraints both narrow matching *and* prevent type-crash 500s:
+
+```csharp
+[HttpGet("{id:int}")]        // only integers reach this action
+[HttpGet("{id:guid}")]       // GUIDs
+[HttpGet("{slug:regex(^[a-z0-9-]+$)}")]
+[HttpGet("{page:int:min(1)}")]   // chained constraints
+
+// Versioning (Asp.Versioning.Http — the maintained fork):
+[ApiController]
+[Route("api/v{version:apiVersion}/products")]
+public class ProductsController : ControllerBase { }
+```
+
+`{id:int}` is the difference between `GET /api/products/abc` returning a clean **400** vs a binding failure or a 500. Always constrain IDs (`int`, `guid`) and paging params (`min(1)`).
+
+### Model binding — where does each value come from?
+
+With `[ApiController]`, inference rules (in this order):
+
+| Parameter | Inferred source |
+|---|---|
+| Complex type (class/record) | `[FromBody]` — JSON body |
+| Simple type matching a route value | `[FromRoute]` |
+| Other simple types (`int`, `string`, `Guid`, `DateTime`, enums) | `[FromQuery]` |
+| `IFormFile` / `IFormCollection` | `[FromForm]` |
+| `CancellationToken` | Special — never bound from input |
+
+Explicit attributes always win over inference, and you can bind from anywhere:
+
+```csharp
+[HttpGet("{id:int}")]
+public async Task<ActionResult<ProductDto>> Get(
+    int id,                                  // from route
+    [FromQuery] bool includeStock = false,   // explicit query
+    [FromHeader(Name = "X-Tenant-Id")] Guid tenantId,  // header
+    CancellationToken ct)                    // special
+{
+    // ...
+}
+```
+
+`[FromServices]` injects a service directly into an action parameter — handy for action-scoped dependencies without constructor noise (constructor injection is still the default you should reach for).
+
+### Validation: DataAnnotations vs FluentValidation
+
+**DataAnnotations** (`[Required]`, `[Range]`, `[MaxLength]`) are declarative, zero-dependency, and fully covered by `[ApiController]` auto-400s. Fine for simple DTOs.
+
+**FluentValidation** is the production standard for anything with rules: complex conditions, cross-field rules, async DB checks, testable validator classes.
+
+```csharp
+public record CreateProductDto(
+    string Name,
+    string Sku,
+    decimal Price,
+    int Stock);
+
+public class CreateProductValidator : AbstractValidator<CreateProductDto>
+{
+    public CreateProductValidator()
+    {
+        RuleFor(x => x.Name)
+            .NotEmpty().MaximumLength(200);
+
+        RuleFor(x => x.Sku)
+            .NotEmpty().Matches("^[A-Z0-9-]{4,32}$")
+            .WithMessage("SKU must be 4-32 chars of A-Z, 0-9 and dashes");
+
+        RuleFor(x => x.Price)
+            .GreaterThan(0)
+            .WithMessage("Price must be positive");
+
+        RuleFor(x => x.Stock)
+            .GreaterThanOrEqualTo(0);
+    }
+}
+```
+
+```csharp
+// Program.cs — wire validators + automatic validation
+using FluentValidation;
+
+builder.Services.AddValidatorsFromAssembly(typeof(CreateProductValidator).Assembly);
+builder.Services.AddFluentValidationAutoValidation(); // from FluentValidation.DependencyInjectionExtensions (v11+)
+```
+
+With auto-validation, a failed validator produces the same `ValidationProblemDetails` 400 as DataAnnotations — but **only on MVC model binding**. When an action calls a service that runs its own validation (CQRS command handlers, background jobs), invoke validators manually:
+
+```csharp
+public class CreateProductCommandHandler
+{
+    private readonly IValidator<CreateProductCommand> _validator;
+
+    public async Task<Result<int>> Handle(CreateProductCommand cmd, CancellationToken ct)
+    {
+        var validation = await _validator.ValidateAsync(cmd, ct);
+        if (!validation.IsValid)
+            return Result.Failure(validation.ToDictionary()); // map errors to Result
+
+        // ... business logic
+    }
+}
+```
+
+### Consistent error responses
+
+Standardize on RFC 9457 (`application/problem+json`) everywhere:
+
+```csharp
+builder.Services.AddProblemDetails();  // .NET 8+; used by exception handler + [ApiController]
+
+// Program.cs
+app.UseExceptionHandler();              // unhandled → 500 problem details
+app.UseStatusCodePages();               // empty non-2xx responses get bodies
+
+// In actions, return problem details explicitly for business failures:
+return Problem(
+    statusCode: StatusCodes.Status409Conflict,
+    title: "SKU already exists",
+    detail: $"A product with SKU '{sku}' is already registered");
+```
+
+The client then always parses the same shape: `{ type, title, status, detail, errors? }`. Never return raw `Exception.ToString()` to clients; log it server-side.
+
+## Common interview questions
+
+**Q1. Controllers or Minimal APIs — how do you decide?**
+Decide by structure, not performance (parity since .NET 8). Controllers for large APIs: resource grouping, reusable filters/conventions, `[ApiController]` auto-validation, attribute routing, versioning. Minimal APIs for small services, one-off endpoints, or when a handler is a few lines with no reuse. Both coexist; Fumadocs-style advice: prefer controllers when the API surface is a product, minimal when it's a sidecar.
+
+**Q2. What does `[ApiController]` actually do?**
+Four behaviors: (1) automatic 400 with `ValidationProblemDetails` on invalid model state, (2) binding-source inference for parameters, (3) requires attribute routing (throws at startup otherwise), (4) participates in problem-details error responses. It exists so controllers get API-first ergonomics without boilerplate.
+
+**Q3. How does model binding choose where a parameter comes from?**
+With `[ApiController]`: complex types from the JSON body; simple types that match a route value from the route; other simple types from the query string; files from form data; `CancellationToken` is special. Explicit `[FromRoute]`/`[FromQuery]`/`[FromBody]`/`[FromHeader]`/`[FromForm]` always override inference.
+
+**Q4. Why use route constraints like `{id:int}`?**
+They make matching unambiguous and safe: `/api/products/abc` can't reach `{id:int}` (→ 400/404 instead of a binding crash), `/api/products/{id}` vs `/api/products/{slug}` disambiguate, and chained constraints (`min(1)`) reject nonsense paging input before your code runs. Also improves route precedence ranking.
+
+**Q5. DataAnnotations vs FluentValidation?**
+DataAnnotations: attribute-based, zero deps, automatic with `[ApiController]` — fine for simple required/range/length rules. FluentValidation: imperative rules as testable classes, complex/cross-field/async validation, named rules, custom messages — the standard for real business rules. Use FluentValidation once rules outgrow "is this field present and in range".
+
+**Q6. `ActionResult<T>` vs `IActionResult`?**
+`ActionResult<T>` is the typed superset: you can return `ProductDto`, `NotFound()`, or `BadRequest()` — it compiles to the right `IActionResult` and carries `T` into OpenAPI metadata (`ProducesResponseType<ProductDto>`), so generated clients get the real response type. Prefer it for API actions; keep `IActionResult` only when no single resource type fits.
+
+**Q7. How do you return validation errors consistently?**
+Let `[ApiController]` produce `ValidationProblemDetails` (RFC 9457 + `errors` dictionary) for model validation; return `Problem(...)` for business failures; `AddProblemDetails()` + `UseExceptionHandler()` for unhandled exceptions. One envelope shape everywhere: `{ type, title, status, detail, errors? }`.
+
+**Q8. When does automatic validation NOT run?**
+Auto-validation hooks model binding. It does not validate: manually invoked service/command layers, background jobs, Minimal API endpoints (unless you add endpoint filters), and deserialized payloads in custom middleware. Call `IValidator<T>.ValidateAsync` explicitly in those paths — this is the classic "validators work in the controller but not in the service" trap.
+
+## Scenario-based questions
+
+**S1. "GET /api/products/abc returns 500 instead of a clean 404/400."**
+- *Symptoms:* non-numeric ID crashes the endpoint; stack trace in logs; works for numeric IDs.
+- *Root cause:* route is `{id}` without `:int` — model binding fails to convert "abc" to `int` and the failure surfaces as an unhandled exception.
+- *Fix:* constrain the route `{id:int}`; verify the binding failure path returns a 400 (or 404 for unknown-but-valid IDs); add a global exception handler so anything that slips through is a problem-details 500, never a raw crash.
+
+**S2. "POST /api/products always receives a null body — no error, just null."**
+- *Symptoms:* `dto` is null; `[ApiController]` doesn't complain; binding silently succeeds with null.
+- *Root cause:* the parameter is an interface or abstract type, or the JSON can't construct it (`System.Text.Json` has no concrete type to instantiate) — or the parameter name/type made inference pick query instead of body (e.g. simple type without `[FromBody]`).
+- *Fix:* bind concrete DTO records; for simple-type bodies add explicit `[FromBody]`; configure `JsonSerializerOptions` (case-insensitivity, `JsonStringEnumConverter`) once in `AddControllers().AddJsonOptions(...)`.
+
+**S3. "Validation errors come back in three different shapes across endpoints."**
+- *Symptoms:* some endpoints return 400 with `errors`, some 200 with a message string, some empty 500s; clients can't parse a unified error.
+- *Root cause:* mixed validation paths — `[ApiController]` auto-validation on some, manual `if (!ModelState.IsValid)` returning `BadRequest(ModelState)` on others, service-layer failures mapped to strings elsewhere.
+- *Fix:* standardize on `ValidationProblemDetails`/`Problem(...)` everywhere; move all validation to FluentValidation validators; keep one exception handler producing problem details; contract-test the error shape in integration tests.
+
+**S4. "Two routes clash: GET /api/products/{id} and GET /api/products/{slug} — sometimes the wrong one wins."**
+- *Symptoms:* requests hit the wrong action intermittently; only one route works; ambiguous-match errors appear after adding the second.
+- *Root cause:* two parameterized routes at the same position — matching is ambiguous; the winner depends on registration/constraint specifics, which is fragile.
+- *Fix:* disambiguate with constraints (`{id:int}` vs `{slug:regex(...)}`), or restructure the URL (`/api/products/id/{id}` vs `/api/products/slug/{slug}`), or use a single action that detects the key type. Never rely on registration order.
+
+**S5. "A client sends a 200MB JSON payload and the API grinds to a halt."**
+- *Symptoms:* memory spikes, slow bindings, timeouts under load; one endpoint accepts arbitrarily large bodies.
+- *Root cause:* no request-size or JSON-depth limits; large payloads are buffered/deserialized wholesale.
+- *Fix:* set `Kestrel` `MaxRequestBodySize` (or `[RequestSizeLimit]` per action), cap JSON `MaxDepth` and `DefaultBufferSize`, validate content-type, and reject oversized requests early with a 413 problem-details response.
+
+## Pitfalls / war stories
+
+- Forgetting `[ApiController]` → no auto-400s, no binding inference, no problem details — every endpoint silently behaves differently.
+- Unconstrained `{id}` routes → type-crash 500s and ambiguous matches.
+- Binding interface/abstract DTOs → `System.Text.Json` 500s that only show under specific payloads.
+- Validation logic hand-rolled inside actions → fat controllers, duplicated rules, drift between endpoints.
+- FluentValidation validators registered but never invoked (missing `AddFluentValidationAutoValidation` or validators in the wrong assembly).
+- Returning `Exception.Message`/`ToString()` to clients → information disclosure; log it, return problem details.
+- `[FromBody]` on GET/POST of simple types omitted → parameter silently bound from query, body ignored.
+- Ignoring `CancellationToken` in long actions → orphaned work on client disconnect (covered more in Ch10).
+
+## Project task — CommerceHub
+
+1. Add DTOs + validators: `CreateProductDto`, `UpdateProductDto`, `ProductDto` (records), and FluentValidation validators (`Name`, `Sku` format, `Price > 0`, `Stock >= 0`).
+2. Create `ProductsController` (`[ApiController]`, `[Route("api/products")]`):
+   - `GET /api/products` — list (with `[FromQuery]` paging: `page:int:min(1)`, `pageSize` capped at 100)
+   - `GET /api/products/{id:int}` — by id, 404 when missing
+   - `POST /api/products` — create, 201 + `CreatedAtAction`, 409 on duplicate SKU via `Problem(...)`
+   - `PUT /api/products/{id:int}` — update, 404 + 400 on validation
+   - `DELETE /api/products/{id:int}` — 204
+3. Wire `AddValidatorsFromAssembly` + `AddFluentValidationAutoValidation` + `AddProblemDetails()` in `Program.cs`.
+4. Register `IProductRepository` (scoped) — stub with an in-memory store until Ch4 brings EF Core.
+5. **Acceptance criteria:** `POST` with an invalid body returns 400 `ValidationProblemDetails` with an `errors` map; `GET /api/products/abc` returns 400 (not 500); `GET /api/products/999` returns 404; duplicate SKU returns 409 problem details; OpenAPI (Microsoft.AspNetCore.OpenApi, .NET 9+) documents all endpoints with response types.
+
+## Self-check quiz
+
+1. Which is NOT a behavior of `[ApiController]`?
+   a) Automatic 400 on invalid ModelState b) Binding-source inference c) Conventional routing support d) Problem-details errors → **c**
+2. A complex-type parameter in a `[ApiController]` action is inferred to bind from:
+   a) Route b) Query c) JSON body d) Form → **c**
+3. `GET /api/products/abc` with route `{id:int}` returns:
+   a) 500 b) 200 c) 400/404 — a clean client error d) Redirect → **c**
+4. FluentValidation auto-validation runs:
+   a) On every service method b) Only on MVC model binding c) In background jobs d) Never with `[ApiController]` → **b**
+5. `ActionResult<T>` gives you:
+   a) Faster serialization b) Typed success + `IActionResult` alternatives with OpenAPI metadata c) Automatic validation d) No benefit over `IActionResult` → **b**
