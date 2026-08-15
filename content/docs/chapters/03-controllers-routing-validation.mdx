@@ -21,7 +21,7 @@ The two hosting styles coexist in the same app. The decision is architectural, n
 |---|---|---|
 | Structure | Class per resource group, actions per verb | Lambda/`Delegate` per endpoint |
 | Best for | Large APIs, many endpoints, heavy reuse (filters, conventions) | Small services, prototypes, high-throughput micro-endpoints |
-| Validation | `[ApiController]` automatic 400s + filters | Manual or endpoint filters (experimental `Http.Validation` package) |
+| Validation | `[ApiController]` automatic 400s + filters | Manual or endpoint filters — built-in `AddValidation()` on .NET 10 |
 | OpenAPI | `ActionResult<T>` metadata | `.Produces<T>()` / built-in .NET 9+ OpenAPI |
 | Testability | `WebApplicationFactory` + controller unit tests | `WebApplicationFactory` + endpoint unit tests |
 | DI in actions | Constructor + `[FromServices]` | Parameter injection |
