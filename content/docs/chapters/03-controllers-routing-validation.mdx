@@ -235,7 +235,7 @@ Auto-validation hooks model binding. It does not validate: manually invoked serv
 - *Root cause:* mixed validation paths — `[ApiController]` auto-validation on some, manual `if (!ModelState.IsValid)` returning `BadRequest(ModelState)` on others, service-layer failures mapped to strings elsewhere.
 - *Fix:* standardize on `ValidationProblemDetails`/`Problem(...)` everywhere; move all validation to FluentValidation validators; keep one exception handler producing problem details; contract-test the error shape in integration tests.
 
-**S4. "Two routes clash: GET /api/products/{id} and GET /api/products/{slug} — sometimes the wrong one wins."**
+**S4. "Two routes clash: `GET /api/products/{id}` and `GET /api/products/{slug}` — sometimes the wrong one wins."**
 - *Symptoms:* requests hit the wrong action intermittently; only one route works; ambiguous-match errors appear after adding the second.
 - *Root cause:* two parameterized routes at the same position — matching is ambiguous; the winner depends on registration/constraint specifics, which is fragile.
 - *Fix:* disambiguate with constraints (`{id:int}` vs `{slug:regex(...)}`), or restructure the URL (`/api/products/id/{id}` vs `/api/products/slug/{slug}`), or use a single action that detects the key type. Never rely on registration order.
