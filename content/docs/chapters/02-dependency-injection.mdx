@@ -1,0 +1,242 @@
+---
+title: "Chapter 2: Dependency Injection, Options & Configuration"
+description: DI lifetimes, scopes, captive dependencies, the options pattern, and fail-fast configuration.
+---
+
+## Learning objectives
+
+- Choose the correct DI lifetime and defend the choice.
+- Explain scopes, captive dependencies, and how the request scope works.
+- Apply the options pattern correctly, including validation and reload.
+- Detect and fix service-locator and singleton-state anti-patterns.
+- Configure fail-fast startup validation so prod config errors surface at boot, not at first request.
+
+## Core concepts
+
+### Lifetimes — the decision table
+
+| Lifetime | Created | Good for | Danger |
+|---|---|---|---|
+| **Transient** | Every resolution | Stateless helpers, lightweight services | Disposables accumulate per request |
+| **Scoped** | Once per scope (per HTTP request) | `DbContext`, unit-of-work, per-request state | Captured in singleton = captive dependency |
+| **Singleton** | Once per process | Caches, `HttpClient`, configuration-backed services | Must be stateless or thread-safe |
+
+```csharp
+builder.Services.AddTransient<IEmailFormatter, EmailFormatter>();   // stateless helper
+builder.Services.AddScoped<IOrderRepository, OrderRepository>();    // wraps DbContext
+builder.Services.AddSingleton<ICacheService, InMemoryCacheService>(); // thread-safe cache
+```
+
+**Default rules of thumb:** `DbContext` scoped; repositories/scoped services scoped; stateless services transient; genuinely shared infrastructure singleton. When unsure, scoped is the safest default — it fails loudly when you're wrong.
+
+### Scopes & the captive dependency
+
+The container creates a **scope per HTTP request**. A scoped service resolved inside that request is one instance, shared by everything in that request. A **captive dependency** is a longer-lived service holding a shorter-lived one — a singleton whose constructor takes `DbContext`:
+
+```csharp
+// BROKEN — the "singleton" captures a DbContext resolved from the ROOT scope.
+// It is now effectively a singleton DbContext: stale, not thread-safe, never per-request.
+public class BrokenSingleton
+{
+    private readonly AppDbContext _db;
+    public BrokenSingleton(AppDbContext db) => _db = db;   // resolved from root!
+}
+
+// CORRECT — create a scope per unit of work
+public class OrderProcessor
+{
+    private readonly IServiceScopeFactory _scopeFactory;
+    public OrderProcessor(IServiceScopeFactory scopeFactory) => _scopeFactory = scopeFactory;
+
+    public async Task ProcessAsync(int orderId)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        // ... work with a fresh, request-like scope
+    }
+}
+```
+
+- In development, `ValidateScopes=true` (default) throws immediately when a scoped service is resolved from the root — this is your friend, don't disable it.
+- `IHostedService`/background workers have **no request scope** — same rule applies: `IServiceScopeFactory` per job iteration.
+
+### Disposal semantics
+
+The container disposes every `IDisposable`/`IAsyncDisposable` **it created**, in reverse creation order, when the scope (or root) is disposed:
+
+- Transient disposables resolved during a request → disposed at request end.
+- Singletons → disposed at shutdown.
+- Do **not** manually dispose container-managed instances; do not register pre-existing instances you don't own as singletons and let the container dispose them.
+
+### The options pattern
+
+Never inject `IConfiguration` into business services. Bind once, validate, and inject strong-typed options:
+
+```csharp
+public class JwtSettings
+{
+    public const string SectionName = "Jwt";
+    public string Issuer { get; init; } = "";
+    public string Audience { get; init; } = "";
+    public string SecretKey { get; init; } = "";
+    public int ExpiryMinutes { get; init; } = 60;
+}
+```
+
+```csharp
+// Registration + validation + fail-fast
+builder.Services.AddOptions<JwtSettings>()
+    .Bind(builder.Configuration.GetSection(JwtSettings.SectionName))
+    .ValidateDataAnnotations()
+    .Validate(s => !string.IsNullOrWhiteSpace(s.SecretKey) && s.SecretKey.Length >= 32,
+              "Jwt:SecretKey must be at least 32 chars")
+    .ValidateOnStart();   // crashes at startup, not on the first request
+```
+
+The three accessors — the most-tested options question in interviews:
+
+| Accessor | Lifetime | Behavior |
+|---|---|---|
+| `IOptions<T>` | Singleton | Reads configuration **once** at first resolution; no reload |
+| `IOptionsSnapshot<T>` | Scoped | Re-reads per request; supports reload + named options |
+| `IOptionsMonitor<T>` | Singleton | Always current value; `OnChange` notifications; supports named options |
+
+```csharp
+// IOptionsSnapshot: settings can change between requests (config file edits, env var changes)
+public class CatalogService
+{
+    private readonly IOptionsSnapshot<CatalogOptions> _options;
+    public CatalogService(IOptionsSnapshot<CatalogOptions> options) => _options = options;
+}
+
+// IOptionsMonitor: background jobs + singletons need reload support without scoping
+public class CacheWarmupHostedService : BackgroundService
+{
+    private readonly IOptionsMonitor<CacheOptions> _options;
+    public CacheWarmupHostedService(IOptionsMonitor<CacheOptions> options) => _options = options;
+}
+```
+
+**Named options** — the same settings class, different configurations (two JWT issuers, two payment gateways):
+
+```csharp
+builder.Services.Configure<GatewaySettings>("Stripe", cfg.GetSection("Gateways:Stripe"));
+builder.Services.Configure<GatewaySettings>("Razorpay", cfg.GetSection("Gateways:Razorpay"));
+// ...
+public class PaymentService(IOptionsSnapshot<GatewaySettings> options)
+{
+    var stripe = options.Get("Stripe");
+}
+```
+
+### Advanced: keyed services (.NET 8+)
+
+Multiple implementations of one interface, resolved by key — cleaner than a hand-rolled factory:
+
+```csharp
+public interface IPaymentGateway { string Name { get; } }
+public class StripeGateway : IPaymentGateway { public string Name => "stripe"; }
+public class RazorpayGateway : IPaymentGateway { public string Name => "razorpay"; }
+
+builder.Services.AddKeyedScoped<IPaymentGateway, StripeGateway>("stripe");
+builder.Services.AddKeyedScoped<IPaymentGateway, RazorpayGateway>("razorpay");
+
+public class CheckoutService([FromKeyedServices("stripe")] IPaymentGateway gateway)
+{
+    // resolves the stripe implementation
+}
+```
+
+### Anti-patterns to name in interviews
+
+- **Service locator:** passing `IServiceProvider` around or a static `ServiceLocator.Instance`. Makes dependencies invisible, untestable, and reorders resolution until it breaks.
+- **Static accessors:** `AppServices.Current.Get<T>()` — same disease, worse (static state, no scoping).
+- **Stateful singletons:** a singleton with mutable per-user state leaks data across users (see S1).
+- **Constructor explosion:** 8+ dependencies → aggregate into a service/mediator or facade, but beware the "god service" — grouping related dependencies is fine, unrelated ones signal an SRP problem.
+- **Injecting `IConfiguration` into domain services:** couples business code to infrastructure; use options.
+- **Disposing your own scoped services:** let the container own the lifecycle.
+
+## Common interview questions
+
+**Q1. Explain the three lifetimes with real use cases.**
+Transient: stateless formatters/validators — cheapest, no sharing. Scoped: `DbContext` and anything wrapping it — one instance per request, matches request semantics, unit-of-work boundaries. Singleton: caches, `HttpClient` (with `IHttpClientFactory`), options-backed config — shared, must be stateless or internally thread-safe.
+
+**Q2. What is a captive dependency, and how do you detect it?**
+A longer-lived service (singleton) captures a shorter-lived one (scoped/transient) — the scoped service is resolved from the root scope and effectively becomes a singleton: stale, wrong per-request semantics, and a thread-safety hazard (e.g. shared `DbContext`). Detection: dev-mode `ValidateScopes` throws at resolution; `ValidateOnStart` catches it at boot; dependency analyzers and code review for singletons taking scoped constructor parameters.
+
+**Q3. `IOptions` vs `IOptionsSnapshot` vs `IOptionsMonitor`?**
+`IOptions<T>` is singleton, reads config once — use for immutable boot-time settings. `IOptionsSnapshot<T>` is scoped, re-reads per request — use in request-scoped services that must see config reloads. `IOptionsMonitor<T>` is singleton with current values and `OnChange` — use in singletons/background services that must react to changes without a scope.
+
+**Q4. Can you inject a scoped service into a singleton? What's the fix?**
+Technically the container resolves it from the root and the behavior breaks (captive dependency). Fixes: (a) inject `IServiceScopeFactory` and create a scope per operation; (b) make the service scoped too; (c) redesign the singleton to be stateless and push the scoped work into an abstraction resolved at the right time.
+
+**Q5. What does the container dispose, and when?**
+Only instances the container itself created, for all lifetimes: transients at the end of the scope they were resolved in, scoped at scope disposal (request end), singletons at host shutdown — all in reverse creation order. Manually disposed or externally created instances are not disposed by the container.
+
+**Q6. Why `ValidateOnStart`?**
+It turns configuration errors into a failed deployment instead of a production incident. Without it, a typo in `appsettings.Production.json` boots fine and explodes on the first request — with it, the host refuses to start and CI/CD fails fast.
+
+**Q7. How do you register multiple implementations of an interface?**
+Named options, keyed services (`.NET 8+`, `AddKeyedScoped<TInterface, TImpl>("key")` + `[FromKeyedServices]`), or a factory abstraction that selects at runtime. Choose keyed services for compile-time clarity; factory for genuinely dynamic selection.
+
+**Q8. When is service locator acceptable?**
+Almost never in application code. Rarely, at a true composition root boundary where the number of dynamically constructed handlers is unbounded and registration-driven — and even then, hide it behind a single abstraction with tests, never sprinkle `IServiceProvider` through business code.
+
+## Scenario-based questions
+
+**S1. "Users started seeing each other's data after we changed a service to singleton 'for performance'."**
+- *Symptoms:* intermittent cross-user data, only after the change, worse under load.
+- *Root cause:* a stateful service promoted to singleton — per-user state (current user, temp lists, mutable fields) now shared across all requests.
+- *Fix:* revert to scoped; if the perf win matters, extract the *stateful* part into scoped services and keep only genuinely stateless/thread-safe parts (`IMemoryCache` is thread-safe — use it) as singletons. Add a test asserting the lifetime, and a code-review rule: singletons must be stateless or internally synchronized.
+
+**S2. "I changed a value in appsettings.json and restarted, but the app still uses the old value."**
+- *Symptoms:* config edit has no effect; value looks stale.
+- *Root cause:* `IOptions<T>` reads configuration once at first resolution and caches it — restart doesn't matter if the process didn't actually restart, or the provider precedence is overridden by an environment variable (env vars beat `appsettings.json`).
+- *Fix:* check for a stale process (`dotnet run` keeps old builds), check `Jwt__Issuer`-style env vars / launchSettings overrides; use `IOptionsSnapshot`/`IOptionsMonitor` where runtime reload is expected; verify with `dotnet user-secrets list` or a debug endpoint that dumps effective config.
+
+**S3. "Boots fine locally, but production crashes on the first request: 'Cannot resolve scoped service from root provider'."**
+- *Symptoms:* first request 500s with the root-provider error; dev never sees it.
+- *Root cause:* a singleton (or middleware constructor) capturing a scoped service. `ValidateScopes` is dev-only, so prod resolves it from the root at runtime.
+- *Fix:* reproduce with `ASPNETCORE_ENVIRONMENT=Production` locally; enable `ValidateOnStart`/`ValidateScopes` everywhere; fix the captive dependency with `IServiceScopeFactory`.
+
+**S4. "Memory grows steadily in production; DbContext instances are never released."**
+- *Symptoms:* RSS climbs until OOM/restart; `dotnet-counters` shows high GC and many `DbContext` instances.
+- *Root cause:* scoped services resolved from the root provider — every resolution creates a new scope that is never disposed, so each `DbContext` (and its connection pool/change tracker) is retained forever. Classic trigger: a singleton factory that calls `GetRequiredService<DbContext>()`.
+- *Fix:* never resolve scoped from root; use `IServiceScopeFactory` with `using var scope` per unit of work; verify with a scoped-instance counter in tests.
+
+**S5. "We have two JWT issuers (mobile + web) but one settings class — registrations clash."**
+- *Symptoms:* one issuer's config overwrites the other's; tokens from one audience fail.
+- *Root cause:* a single `Configure<JwtSettings>` binding both — last bind wins.
+- *Fix:* named options: `Configure<JwtSettings>("Mobile", ...)` / `Configure<JwtSettings>("Web", ...)`, consume with `IOptionsSnapshot<JwtSettings>.Get("Mobile")`.
+
+## Pitfalls / war stories
+
+- `ValidateScopes` disabled "to fix" a root-provider error — you've now hidden a captive dependency in prod.
+- Singletons that lazily resolve scoped services via `IServiceProvider` in constructor-adjacent code (service locator smell).
+- Registering the same instance under two interfaces with `AddSingleton<IX>()` + `AddSingleton<IY>()` → **two different instances** unless you share via factory/instance — a classic "why is my state not shared" bug.
+- Disposing a `DbContext` manually, then having the container dispose it again → `ObjectDisposedException` on the next request.
+- `IOptions<T>` used for settings that must hot-reload → silent staleness in long-running pods.
+- Injecting `IConfiguration` everywhere → untestable services and config keys scattered through domain code.
+- Not registering `IHttpClientFactory` and `new HttpClient()` per call → socket exhaustion (covered properly in Ch7).
+
+## Project task — CommerceHub
+
+1. Add settings classes: `JwtSettings`, `DatabaseOptions`, `CatalogOptions` (in `src/CommerceHub.Api/Options/`), each with `const string SectionName`.
+2. Register them via `AddOptions<T>().Bind(...).Validate...().ValidateOnStart()`; deliberately break `Jwt:SecretKey` once and confirm the app **fails to start**.
+3. Register services with correct lifetimes: `IOrderRepository` scoped, `IEmailFormatter` transient, `ICacheService` (MemoryCache-backed) singleton.
+4. Add a `JwtSettings`-consuming singleton (e.g. `TokenIssuer`) using `IOptionsMonitor<JwtSettings>` — verify `OnChange` fires when config reloads in dev.
+5. Implement `[FromKeyedServices]`-based gateway selection: register `StripeGateway`/`RazorpayGateway` as keyed scoped services; inject one into a demo endpoint.
+6. **Acceptance criteria:** app starts only with valid config; a wrong `SecretKey` fails CI-style at boot; unit test asserting `IOrderRepository` resolves once per request (scoped) and `TokenIssuer` is a singleton; no `IConfiguration` injected into any service outside `Program.cs`/composition root.
+
+## Self-check quiz
+
+1. A `DbContext` injected into a singleton service is:
+   a) Fine, EF Core is thread-safe b) A captive dependency c) Faster d) Automatically recreated per request → **b**
+2. Which options accessor supports change notifications?
+   a) `IOptions<T>` b) `IOptionsSnapshot<T>` c) `IOptionsMonitor<T>` d) `IConfiguration` → **c**
+3. `ValidateOnStart()` causes:
+   a) Validation on every request b) Fail-fast at startup c) Runtime logging only d) Nothing in prod → **b**
+4. Keyed services were introduced in:
+   a) .NET 6 b) .NET 7 c) .NET 8 d) .NET Framework → **c**
+5. The container disposes instances it created:
+   a) Only singletons b) Only scoped c) All lifetimes, at scope/root disposal d) Never → **c**

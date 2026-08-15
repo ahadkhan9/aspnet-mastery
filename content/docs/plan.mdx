@@ -1,0 +1,79 @@
+---
+title: The 2-Week Plan
+description: Chapter map, schedule, the improved prompt, and the CommerceHub project design.
+---
+
+> **Audience:** staff-level engineer. Assumes you already know software engineering
+> deeply; this plan targets .NET-specific depth, senior-level nuance, and interview
+> scenarios. No beginner filler, no fluff — everything is copy-pasteable.
+>
+> **Target:** .NET 8 (LTS) or later. Where .NET 9/10 changes something relevant, it is called out inline.
+
+## Why this plan works
+
+1. **One project beats ten mini-demos.** Every chapter lands on the *same* codebase, so concepts compound: auth built in Ch6 protects every endpoint you write after it; the background job from Ch8 uses the CQRS handlers from Ch5; the tests from Ch9 lock in everything before. Two weeks is too short for breadth — so we optimize for compounding depth.
+2. **Chapters map 1:1 to project features.** You're never "learning a topic," you're "shipping the next slice of CommerceHub." Each chapter ends with a concrete, verifiable project task.
+3. **Scenario questions are the highest-ROI interview prep at your level.** Nobody asks a staff engineer "what is DI?" They ask *"your singleton is leaking user data across sessions — why?"* Every chapter therefore carries both Q&A and root-cause scenarios.
+4. **The improved prompt makes this repeatable.** You hand over a chapter name + index, and get back a consistent, dense artifact. Same structure every time, so you can skim fast.
+
+## The improved prompt (use this to request ANY future chapter)
+
+```text
+Chapter {N}: {Chapter Title}
+
+Write a complete self-contained chapter for my ASP.NET Core Web API mastery
+course (2-week, interview + project driven). I am a staff engineer — assume
+senior-level engineering knowledge, no beginner filler. Target .NET 8+ (note
+.NET 9/10 differences where relevant).
+
+Structure, strictly in this order:
+1. Learning objectives — 5–7 measurable bullets.
+2. Core concepts — deep, accurate senior-level explanations, each with a
+   COMPLETE copy-pasteable C# code sample (no ellipses, no "// ..." placeholders).
+3. Common interview questions — 6–8 Q&A pairs, answers 3–6 sentences, covering
+   "explain X", "compare X vs Y", and "how would you do X in production".
+4. Scenario-based interview questions — 4–5 real-world debugging/design
+   scenarios, each with: Symptoms → Root cause → Step-by-step fix.
+5. Pitfalls / war stories — 5–7 mistakes seniors actually make, one line each.
+6. Project task — concrete instructions mapping this chapter onto the
+   CommerceHub API (files to create/modify, acceptance criteria).
+7. Self-check quiz — 5 MCQs with answers at the end.
+
+Constraints: no AI-slop phrases, no generic advice, no "in conclusion" fluff.
+Code must compile against .NET 8+ defaults. Every claim must be technically
+accurate — if you're not certain, say so explicitly instead of guessing.
+```
+
+## The 2-week chapter map
+
+**Cadence:** ~3–4 focused hours/day. Days 7 and 14 are buffer + review. If you fall behind, skip quiz/reading and do the project task — building beats reading.
+
+| # | Chapter | Core topics | Project increment (CommerceHub) |
+|---|---|---|---|
+| 1 | **ASP.NET Core Fundamentals** | Hosting model, Kestrel, middleware pipeline, configuration, logging, health checks | Scaffold solution, health checks, request-logging middleware |
+| 2 | **DI, Options & Configuration** | Lifetimes, scopes, captive dependencies, options pattern, validation, fail-fast | Register services by lifetime, options classes, `ValidateOnStart` |
+| 3 | **Controllers, Routing, Binding & Validation** | Controllers vs Minimal APIs, attribute routing, model binding, FluentValidation | Catalog endpoints (Products CRUD) with validation |
+| 4 | **EF Core Deep Dive** | DbContext, migrations, relationships, tracking vs no-tracking, N+1, compiled queries | Schema: Customers, Products, Orders, OrderItems; seed data |
+| 5 | **Architecture & CQRS** | Layering, MediatR, repository pattern, Result pattern, ProblemDetails | Refactor catalog to MediatR handlers + `Result<T>` + global error handling |
+| 6 | **Authentication & Authorization** | JWT, refresh tokens, Identity, claims, policies, roles | Register/login, role-protected admin endpoints, custom policy |
+| 7 | **Caching, Rate Limiting & Resilience** | IMemoryCache/Redis, output caching, rate limiter, Polly pipelines | Cache product catalog, rate-limit auth endpoints, retry on payments |
+| 8 | **Background Jobs & Real-time** | Hangfire/Quartz, SignalR, hosted services | Invoice-generation job, order-status SignalR hub |
+| 9 | **Testing** | xUnit, unit tests, WebApplicationFactory, Testcontainers | Integration tests for the order flow against real Postgres |
+| 10 | **Observability & Performance** | Serilog, OpenTelemetry, structured logging, profiling | Structured logs + tracing spans on order flow, detailed health |
+| 11 | **Containers & CI/CD** | Dockerfile, compose, GitHub Actions, secrets, K8s basics | Dockerize API + Postgres, CI (build+test), CD to VM |
+| 12 | **Review & Mock Interview** | Architecture retro, trade-offs, system-design drill, STAR stories | Final docs, retro notes, scenario drills |
+
+**Schedule:** Days 1–6 = Ch1–6 · Day 7 = buffer/review · Days 8–13 = Ch7–12 · Day 14 = full mock interview + gap fixing.
+
+## The single project: CommerceHub API
+
+An order & inventory e-commerce backend — big enough to need everything, small enough to finish in 2 weeks.
+
+- **Modules:** Catalog (products) → Inventory → Customers/Identity → Orders → Payments (mock) → Notifications (SignalR) → Invoicing (background job).
+- **Stack:** .NET 8/9 Web API · EF Core + PostgreSQL · Redis (cache) · MediatR · FluentValidation · JWT auth · Hangfire · SignalR · Serilog · OpenTelemetry · xUnit + Testcontainers · Docker.
+- **Why this shape:** every chapter lands on something real; auth is needed by everything downstream; background jobs + realtime + caching arise naturally instead of being bolted on; the end result is a genuinely deployable service you can talk about in interviews.
+
+## Chapters
+
+- [Chapter 1: ASP.NET Core Fundamentals](./chapters/01-fundamentals.mdx)
+- [Chapter 2: Dependency Injection, Options & Configuration](./chapters/02-dependency-injection.mdx)

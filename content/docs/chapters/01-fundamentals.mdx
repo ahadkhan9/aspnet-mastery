@@ -1,0 +1,295 @@
+---
+title: "Chapter 1: Fundamentals — Pipeline & Middleware"
+description: Hosting model, Kestrel, the request pipeline, middleware, configuration, logging and health checks.
+---
+
+## Learning objectives
+
+- Explain the minimal hosting model (`WebApplicationBuilder`) and how it replaced the `Startup` class era.
+- Describe a request's full journey from socket to response, including pipeline unwinding.
+- Order middleware correctly and justify every placement decision.
+- Build custom middleware with correct constructor vs `InvokeAsync` injection.
+- Configure the app per-environment and read configuration safely.
+- Expose health checks and use structured logging instead of `Console.WriteLine`.
+
+## Core concepts
+
+### The hosting model
+
+Since .NET 6 there is one file, `Program.cs`, with top-level statements:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// 1) Register services with the DI container
+builder.Services.AddControllers();
+builder.Services.AddHealthChecks();
+builder.Services.AddProblemDetails();
+
+// 2) Build the app (after this point, service registration is frozen)
+var app = builder.Build();
+
+// 3) Compose the middleware pipeline (ORDER MATTERS — see below)
+if (app.Environment.IsDevelopment())
+{
+    app.UseDeveloperExceptionPage();
+}
+else
+{
+    app.UseExceptionHandler(); // uses ProblemDetails service → RFC 9457 responses
+}
+
+app.UseForwardedHeaders();   // behind a proxy/ALB: restores real client IP & scheme
+app.UseHttpsRedirection();
+app.UseRouting();            // explicit here — you control placement
+app.UseCors("frontend");
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();        // terminal endpoint middleware
+app.MapHealthChecks("/health");
+
+app.Run();
+```
+
+**Kestrel** is the default in-process web server: cross-platform, socket-based, high-throughput (consistently near the top of TechEmpower benchmarks), supports HTTP/1.1, HTTP/2 and HTTP/3 (QUIC). On Windows it can sit behind IIS; the `UseForwardedHeaders` call above is what makes proxy setups behave.
+
+### The middleware pipeline — the single most important concept in this chapter
+
+Middleware are delegates chained in order; each calls `next()` (or short-circuits). **Order is the behavior.** A request flows *down* the chain, then the response flows *back up* — so middleware can do work before and after `next()`.
+
+Canonical production order:
+
+```text
+Exception handling        ← must be FIRST (catches everything downstream)
+  → HTTPS redirection
+    → ForwardedHeaders    ← must be EARLY (fixes IP/scheme before anything reads them)
+      → Routing
+        → CORS
+          → Authentication
+            → Authorization
+              → Custom business middleware
+                → Endpoints (terminal)
+```
+
+Rules that are actually tested in interviews:
+
+- **`UseAuthentication` must come after routing** (it needs route data for some auth handlers). With implicit routing (.NET 7+), if you don't call `UseRouting`, the framework inserts it automatically — but if you *do* call it, you own the placement.
+- **Middleware added after `MapControllers()` never runs** for controller requests. Terminal middleware ends the chain.
+- Anything registered *between* `UseRouting()` and the endpoint mapping runs after routing but before endpoint execution — the right place for tenant resolution, audit headers, request-scoped business middleware.
+
+Inline vs class-based middleware:
+
+```csharp
+// Inline — fine for one-liners
+app.Use(async (context, next) =>
+{
+    context.Items["startedAt"] = DateTimeOffset.UtcNow;
+    await next();
+});
+
+// Class-based — the production standard (testable, reusable)
+public class RequestLoggingMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger<RequestLoggingMiddleware> _logger;
+
+    // Constructor: singleton/static dependencies ONLY (middleware is created once at startup)
+    public RequestLoggingMiddleware(RequestDelegate next, ILogger<RequestLoggingMiddleware> logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    // Scoped dependencies come as InvokeAsync parameters — resolved per request
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation("--> {Method} {Path} from {Ip}",
+            context.Request.Method, context.Request.Path, context.Connection.RemoteIpAddress);
+
+        try
+        {
+            await _next(context);
+        }
+        finally
+        {
+            sw.Stop();
+            _logger.LogInformation("<-- {Method} {Path} → {Status} in {Elapsed}ms",
+                context.Request.Method, context.Request.Path, context.Response.StatusCode, sw.ElapsedMilliseconds);
+        }
+    }
+}
+
+// Registration
+app.UseMiddleware<RequestLoggingMiddleware>();
+```
+
+**Short-circuiting** is legitimate when done deliberately — auth, static files, cached responses:
+
+```csharp
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/health"))
+    {
+        context.Response.StatusCode = StatusCodes.Status200OK;
+        await context.Response.WriteAsync("ok");   // terminal: next() never called
+        return;
+    }
+    await next();
+});
+```
+
+Branching: `app.Map("/admin", branch => ...)` (path branch), `app.UseWhen(ctx => cond, branch => ...)` (conditional branch that *rejoins* the main chain). `app.Run(...)` is terminal middleware sugar.
+
+### Exception handling
+
+- Dev: `UseDeveloperExceptionPage()` — rich stack traces.
+- Prod: `UseExceptionHandler()` + `AddProblemDetails()` → automatic RFC 9457 JSON (`application/problem+json`) with a sensible envelope.
+- One warning worth knowing: if the response has already started (`context.Response.HasStarted`), an exception thrown downstream can no longer produce a clean error response — the connection is just aborted and the exception is logged. Buffering is the fix for middleware that writes then fails.
+
+### Configuration
+
+Providers are layered, **last one wins**:
+
+```text
+appsettings.json → appsettings.{Environment}.json → User Secrets (dev only)
+→ environment variables (__ = section separator, e.g. Jwt__Issuer)
+→ command-line args
+```
+
+```csharp
+var conn = builder.Configuration.GetConnectionString("CommerceDb");   // "Postgres:CommerceDb"
+var jwtIssuer = builder.Configuration["Jwt:Issuer"];
+var profile = builder.Configuration.GetSection("Profile").Get<ProfileSettings>(); // binds to POCO
+```
+
+Environment comes from `ASPNETCORE_ENVIRONMENT` (or `DOTNET_ENVIRONMENT`); `launchSettings.json` only affects local `dotnet run`. Never put secrets in `appsettings.json` — use User Secrets in dev, vault/secret manager in prod.
+
+### Structured logging
+
+Always use message templates with named placeholders — never string interpolation. The point of structured logging is that the *structure* (name/value pairs) survives, not the string.
+
+```csharp
+// GOOD — queryable in Serilog/App Insights/CloudWatch
+_logger.LogInformation("Order {OrderId} created by user {UserId} with {ItemCount} items", orderId, userId, items);
+
+// BAD — a melted string nobody can filter
+_logger.LogInformation($"Order {orderId} created by {userId}");
+```
+
+Use `ILogger<T>`; filter by category and level in `appsettings.json`; the built-in console provider is fine for now — Serilog arrives in Ch10.
+
+### Health checks
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<AppDbContext>();   // needs EF Core health check package
+// ...
+app.MapHealthChecks("/health", new HealthCheckOptions
+{
+    ResultStatusCodes =
+    {
+        [HealthStatus.Healthy] = StatusCodes.Status200OK,
+        [HealthStatus.Degraded] = StatusCodes.Status503ServiceUnavailable,
+        [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
+    },
+    ResponseWriter = async (ctx, report) =>
+    {
+        ctx.Response.ContentType = "application/json";
+        await ctx.Response.WriteAsync(JsonSerializer.Serialize(new
+        {
+            status = report.Status.ToString(),
+            checks = report.Entries.Select(e => new { name = e.Key, status = e.Value.Status.ToString() })
+        }));
+    }
+});
+```
+
+In Kubernetes you typically expose two probes: **liveness** (is the process alive — no dependencies) and **readiness** (can it serve traffic — DB/redis checks). Don't point both at a check that includes dependencies.
+
+## Common interview questions
+
+**Q1. Walk me through a request's life in ASP.NET Core.**
+Kestrel accepts the socket connection and hands the request to the host → the request enters the middleware pipeline and flows down through each middleware until the terminal endpoint middleware → routing matches the path to an endpoint → the action is invoked through the controller pipeline (filters → binding → action → result) → the response unwinds back up through the pipeline, letting each middleware run post-`next()` work (logging, headers) → Kestrel writes bytes to the socket.
+
+**Q2. `Use` vs `Run` vs `Map` vs `UseWhen`?**
+`Use` adds a middleware that calls `next()`; `Run` is terminal (never calls next); `Map` branches the pipeline by path prefix (doesn't rejoin); `UseWhen` branches conditionally and *rejoins* the main chain if the branch doesn't terminate.
+
+**Q3. Why does middleware order matter? Give a concrete bug from misordering.**
+Order *is* the pipeline — each middleware can only see what upstream middleware produced. Example: putting `UseAuthentication` before `UseRouting` breaks auth handlers that need route data; putting a custom logging middleware after `MapControllers()` means it never executes; putting `UseExceptionHandler` anywhere but first means exceptions thrown by earlier middleware escape unhandled.
+
+**Q4. A custom middleware needs `DbContext` (scoped). Where do you inject it?**
+Not the constructor — middleware instances are created once at startup, so constructors can only receive singleton/static dependencies (logger, config, options). Scoped services must be declared as `InvokeAsync(HttpContext, IScopedThing)` parameters; the framework resolves them from the per-request scope at invocation time.
+
+**Q5. What changed in .NET 7+ regarding routing?**
+Endpoint routing became implicit: if you never call `UseRouting`/`UseEndpoints`, `WebApplication` inserts them for you (routing before the first middleware that needs route data, endpoints at the end). Call them explicitly only when you need to control placement — e.g. business middleware that must run after routing but before endpoint execution.
+
+**Q6. Kestrel vs IIS vs HTTP.sys?**
+Kestrel is the in-process cross-platform server (the default). IIS is a full-featured web server that typically runs Kestrel in-process behind it on Windows (or out-of-process via HTTP.sys). HTTP.sys is a Windows-only kernel-mode server for scenarios needing port sharing, Windows auth, or TLS passthrough without IIS. For containers/Linux, Kestrel alone is correct.
+
+**Q7. How do you handle exceptions globally?**
+Standard: `AddProblemDetails()` + `UseExceptionHandler()` for unhandled exceptions, plus `UseStatusCodePages()` for non-2xx/3xx codes without bodies. Middleware handles cross-cutting concerns; exception *filters* are controller-specific and leak into API surface design — prefer middleware for global policy.
+
+**Q8. When is short-circuiting middleware legitimate?**
+Auth failures, static files, health probes (don't pay pipeline costs for probes), serving cached responses, blocking IPs. The key discipline: short-circuit *deliberately and narrowly* — a middleware that silently swallows requests is how production mysteries are born.
+
+## Scenario-based questions
+
+**S1. "It works locally, but in production every API call returns 500 with a generic message."**
+- *Symptoms:* generic 500, no details, works in dev.
+- *Root cause:* dev uses `UseDeveloperExceptionPage()`; prod has the exception handler. The real error is swallowed by generic handling — often a config difference (connection string, env var), not code.
+- *Fix:* check structured logs for the logged exception (it should be logged by the exception handler); temporarily compare config between environments; reproduce with `ASPNETCORE_ENVIRONMENT=Production` locally; never ship `UseDeveloperExceptionPage` to prod.
+
+**S2. "After adding custom auth middleware, health checks and static files return 401 too."**
+- *Symptoms:* everything behind the middleware is rejected, including endpoints that should be public.
+- *Root cause:* middleware placed before any branching, with no exclusions, so it applies to every path.
+- *Fix:* either move it after routing and make it endpoint-aware, or use `UseWhen(ctx => !ctx.Request.Path.StartsWithSegments("/health"), branch => branch.UseMyAuth())`; or implement it as an authorization *policy* applied only where needed.
+
+**S3. "Client IP is always 127.0.0.1 in logs behind an AWS ALB, and HTTPS redirect loops."**
+- *Symptoms:* logs show loopback IP; sometimes infinite redirects.
+- *Root cause:* `HttpContext.Connection.RemoteIpAddress` is the proxy's address; the app also thinks the scheme is HTTP because the proxy terminated TLS.
+- *Fix:* `app.UseForwardedHeaders()` with `ForwardedHeaders.XForwardedFor | XForwardedProto` as the *first* middleware, and configure `KnownProxies`/`KnownNetworks` so spoofed `X-Forwarded-For` headers from the internet are ignored.
+
+**S4. "My response-time logging middleware shows ~0ms for slow endpoints and nonsense for streamed responses."**
+- *Symptoms:* timings inconsistent, negative/zero durations.
+- *Root cause:* `Stopwatch` started too late (after `next()`), or measured only the wrapper while the response streams after the middleware unwinds; also the response may be written incrementally so `HasStarted` is true when you try to set status codes.
+- *Fix:* start the stopwatch before `next()`, stop in `finally`, and never mutate the response after `next()` if `HasStarted` is true — log status before returning.
+
+**S5. "One slow endpoint causes latency spikes across the whole service."**
+- *Symptoms:* global latency degradation; CPU threads saturated; one endpoint makes a synchronous DB/HTTP call.
+- *Root cause:* sync-over-async — a synchronous blocking call inside an async pipeline starves the thread pool.
+- *Fix:* make the call truly async end-to-end (`await` all the way, no `.Result`/`.Wait()`); confirm with `dotnet-counters` (thread pool queue length) or the thread-pool-starvation diagnostic logs.
+
+## Pitfalls / war stories
+
+- Placing `UseExceptionHandler` after middleware that can throw → exceptions escape as bare 500s with no logging.
+- `Console.WriteLine` in middleware → no structured data, no filtering, no correlation IDs.
+- Middleware constructor injecting scoped services → `InvalidOperationException: Cannot resolve scoped service from root provider` (dev) or silent wrong behavior (prod).
+- Forgetting `UseForwardedHeaders` behind any proxy → wrong IPs, wrong scheme, broken security decisions based on IP.
+- Wrapping `await next()` in `try/catch` and rethrowing *after* touching the response → `Response.HasStarted` aborts the connection.
+- Calling `builder.Services.AddControllers()` after `builder.Build()` → `InvalidOperationException`; registration is frozen at build time.
+- Using `IApplicationBuilder`-era docs (`.UseMvc()`, `Startup.cs`) → obsolete patterns; anything you read should be for .NET 6+ minimal hosting.
+
+## Project task — CommerceHub
+
+1. Create the solution: `CommerceHub.sln` with `src/CommerceHub.Api` (Web API, .NET 8+).
+2. Add `AddControllers()`, `AddProblemDetails()`, `AddHealthChecks()` with a simple liveness check.
+3. Build the pipeline in canonical order (exception → forwarded headers → https → routing → cors → auth → authorization → endpoints). CORS: allow `http://localhost:5173` for now.
+4. Implement `RequestLoggingMiddleware` (class-based, `ILogger<T>`, stopwatch, status code) and register it between authorization and endpoints.
+5. Add `/health` (raw) and `/health/detailed` (JSON with checks) endpoints.
+6. Move the connection string to `appsettings.Development.json` + User Secrets; bind a `DatabaseOptions` POCO.
+7. **Acceptance criteria:** `dotnet run` starts clean; `curl localhost:5xxx/health` returns ok; every request appears in console logs with method, path, status, duration; `ASPNETCORE_ENVIRONMENT=Production` run still serves `/health` and returns JSON errors for an unhandled exception (throw one temporarily to verify).
+
+## Self-check quiz
+
+1. Which middleware MUST be registered first in the pipeline?
+   a) Authentication b) Exception handling c) CORS d) Routing → **b**
+2. Where do you inject a scoped service into a class-based middleware?
+   a) Constructor b) `InvokeAsync` parameters c) `IServiceProvider` static d) You can't → **b**
+3. `app.Map("/admin", ...)` creates a pipeline that:
+   a) Runs and rejoins the main chain b) Terminates and never rejoins c) Only runs on POST d) Replaces routing → **b**
+4. Which configuration provider has the HIGHEST precedence?
+   a) `appsettings.json` b) `appsettings.Production.json` c) Environment variables d) `launchSettings.json` → **c**
+5. Why can't a middleware rewrite the status code after `await next()` in a streaming response?
+   a) It's slow b) `Response.HasStarted` is true — headers are already sent c) CORS blocks it d) It's a .NET bug → **b**
