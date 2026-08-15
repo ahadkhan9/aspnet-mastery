@@ -77,6 +77,7 @@ Rules that are actually tested in interviews:
 - **`UseAuthentication` must come after routing** (it needs route data for some auth handlers). With implicit routing (.NET 7+), if you don't call `UseRouting`, the framework inserts it automatically — but if you *do* call it, you own the placement.
 - **Middleware added after `MapControllers()` never runs** for controller requests. Terminal middleware ends the chain.
 - Anything registered *between* `UseRouting()` and the endpoint mapping runs after routing but before endpoint execution — the right place for tenant resolution, audit headers, request-scoped business middleware.
+- **HSTS** (`UseHsts()`) belongs with exception handling in non-development environments — templates add it for you.
 
 Inline vs class-based middleware:
 
@@ -180,6 +181,11 @@ _logger.LogInformation($"Order {orderId} created by {userId}");
 
 Use `ILogger<T>`; filter by category and level in `appsettings.json`; the built-in console provider is fine for now — Serilog arrives in Ch10.
 
+Two framework features worth knowing before you write custom middleware:
+
+- **`AddHttpLogging()`** — built-in request/response logging middleware (method, path, status, latency). Enable it when you want framework-level HTTP logs, and configure `HttpLoggingFields` so bodies/headers with sensitive data (tokens, passwords, cookies) are never logged.
+- **Correlation IDs** — echo the client's `X-Correlation-Id` (or generate one) in an early middleware and attach it to every log line (`ILogger.BeginScope(...)` or `ActivityTrackingOptions`), so one request is traceable across all its logs. Request diagnostics belong in middleware/infrastructure — never sprinkled through business logic.
+
 ### Health checks
 
 ```csharp
@@ -234,6 +240,9 @@ Standard: `AddProblemDetails()` + `UseExceptionHandler()` for unhandled exceptio
 **Q8. When is short-circuiting middleware legitimate?**
 Auth failures, static files, health probes (don't pay pipeline costs for probes), serving cached responses, blocking IPs. The key discipline: short-circuit *deliberately and narrowly* — a middleware that silently swallows requests is how production mysteries are born.
 
+**Q9. Do you need `ConfigureAwait(false)` in ASP.NET Core?**
+No — ASP.NET Core request handling runs without a `SynchronizationContext` on the server, so there is nothing to capture; `ConfigureAwait(false)` is a no-op there. It matters in UI frameworks (WinForms/WPF) where continuations must return to the UI thread. On the server the real dangers are sync-over-async (`.Result`/`.Wait()`), missing `await`, and ignored `CancellationToken`s — none of which `ConfigureAwait` fixes.
+
 ## Scenario-based questions
 
 **S1. "It works locally, but in production every API call returns 500 with a generic message."**
@@ -259,7 +268,7 @@ Auth failures, static files, health probes (don't pay pipeline costs for probes)
 **S5. "One slow endpoint causes latency spikes across the whole service."**
 - *Symptoms:* global latency degradation; CPU threads saturated; one endpoint makes a synchronous DB/HTTP call.
 - *Root cause:* sync-over-async — a synchronous blocking call inside an async pipeline starves the thread pool.
-- *Fix:* make the call truly async end-to-end (`await` all the way, no `.Result`/`.Wait()`); confirm with `dotnet-counters` (thread pool queue length) or the thread-pool-starvation diagnostic logs.
+- *Fix:* make the call truly async end-to-end (`await` all the way, no `.Result`/`.Wait()`); parallelize independent calls with `Task.WhenAll` instead of awaiting in a loop; confirm with `dotnet-counters` (thread pool queue length) or the thread-pool-starvation diagnostic logs.
 
 ## Pitfalls / war stories
 
@@ -273,7 +282,15 @@ Auth failures, static files, health probes (don't pay pipeline costs for probes)
 
 ## Project task — CommerceHub
 
-1. Create the solution: `CommerceHub.sln` with `src/CommerceHub.Api` (Web API, .NET 8+).
+1. Create the solution and project — `dotnet new webapi` defaults to Minimal APIs, so `--use-controllers` is required:
+
+    ```bash
+    dotnet new sln -n CommerceHub
+    dotnet new webapi -n CommerceHub.Api -o src/CommerceHub.Api --use-controllers
+    dotnet sln add src/CommerceHub.Api
+    ```
+
+    (.NET 9/10 templates ship OpenAPI by default.)
 2. Add `AddControllers()`, `AddProblemDetails()`, `AddHealthChecks()` with a simple liveness check.
 3. Build the pipeline in canonical order (exception → forwarded headers → https → routing → cors → auth → authorization → endpoints). CORS: allow `http://localhost:5173` for now.
 4. Implement `RequestLoggingMiddleware` (class-based, `ILogger<T>`, stopwatch, status code) and register it between authorization and endpoints.

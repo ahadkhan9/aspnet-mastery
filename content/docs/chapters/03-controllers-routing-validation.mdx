@@ -28,6 +28,28 @@ The two hosting styles coexist in the same app. The decision is architectural, n
 
 **Default rule:** for CommerceHub (many resources, shared validation/filters, versioning ahead) — **controllers**. Reach for Minimal APIs per-endpoint when the handler is a couple of lines and has no reusable surface.
 
+For contrast, the same endpoint as a Minimal API — route group, `TypedResults`, rich OpenAPI metadata:
+
+```csharp
+var products = app.MapGroup("/api/products")
+    .WithTags("Products");
+
+products.MapGet("/{id:int}", async (int id, IProductRepository repo, CancellationToken ct) =>
+{
+    var product = await repo.GetByIdAsync(id, ct);
+    return product is null
+        ? Results.NotFound()
+        : Results.Ok(product);          // TypedResults: explicit, testable response shapes
+})
+    .WithName("GetProductById")                       // stable operation id
+    .WithDescription("Returns a product by id")
+    .Produces<ProductDto>(StatusCodes.Status200OK)
+    .Produces(StatusCodes.Status404NotFound)
+    .ProducesValidationProblem();
+```
+
+Rules of thumb: prefer `TypedResults` over ad hoc `IResult`; one route group per resource; and don't mix both styles in the same feature unless the split is genuinely useful.
+
 ### `[ApiController]` — the attribute that changes everything
 
 Adding `[ApiController]` to a controller class (plus `[Route]`) switches on a bundle of behaviors — the most-tested controller fact in interviews:
@@ -65,6 +87,8 @@ public class ProductsController : ControllerBase
     }
 }
 ```
+
+Notice the DTO boundary: actions take `CreateProductDto` and return `ProductDto` — never EF entities directly. DTOs decouple the API contract from persistence models; returning entities leaks schema, tracking state, and navigation cycles to clients (a Ch4 theme).
 
 ### Attribute routing & constraints
 
@@ -267,7 +291,8 @@ Auto-validation hooks model binding. It does not validate: manually invoked serv
    - `DELETE /api/products/{id:int}` — 204
 3. Wire `AddValidatorsFromAssembly` + `AddFluentValidationAutoValidation` + `AddProblemDetails()` in `Program.cs`.
 4. Register `IProductRepository` (scoped) — stub with an in-memory store until Ch4 brings EF Core.
-5. **Acceptance criteria:** `POST` with an invalid body returns 400 `ValidationProblemDetails` with an `errors` map; `GET /api/products/abc` returns 400 (not 500); `GET /api/products/999` returns 404; duplicate SKU returns 409 problem details; OpenAPI (Microsoft.AspNetCore.OpenApi, .NET 9+) documents all endpoints with response types.
+5. Create `Products.http` (REST Client format) covering every CRUD request in dependency order — create a product, then GET/PUT/DELETE it — and run it end-to-end in your IDE.
+6. **Acceptance criteria:** `POST` with an invalid body returns 400 `ValidationProblemDetails` with an `errors` map; `GET /api/products/abc` returns 400 (not 500); `GET /api/products/999` returns 404; duplicate SKU returns 409 problem details; OpenAPI (Microsoft.AspNetCore.OpenApi, .NET 9+) documents all endpoints with names, tags, and response types.
 
 ## Self-check quiz
 
